@@ -1,16 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"net/http"
 	"net/url"
 	"os"
+
+	"golang.org/x/sync/errgroup"
 )
 
 func main() {
@@ -23,15 +25,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "specify csv file with -i\n")
 		os.Exit(1)
 	}
-	if *outfile == "" {
-		fmt.Fprintf(os.Stderr, "specify output file with -o\n")
-		os.Exit(1)
+	if err := newApp(*infile, *outfile).run(); err != nil {
+		fmt.Fprintf(os.Stderr, "%v", err)
 	}
-
-	run(infile, outfile)
 }
 
-type Geo struct {
+type geo struct {
 	Results []struct {
 		FormattedAddress string `json:"formatted_address"`
 		Geometry         struct {
@@ -44,37 +43,62 @@ type Geo struct {
 	Status string `json:"status"`
 }
 
+// App represents this application
 type App struct {
-	AddressFile   *os.File
-	GeoDecodeFile *os.File
+	AddressFile   string
+	GeoDecodeFile string
+	Client        *http.Client
 }
 
 // NewApp creates a new application with input and output file pointer.
-func newApp(addressFile, decodedFile *os.File) *App {
+func newApp(infile, outfile string) *App {
 	return &App{
-		AddressFile:   addressFile,
-		GeoDecodeFile: decodedFile,
+		AddressFile:   infile,
+		GeoDecodeFile: outfile,
+		Client:        &http.Client{},
 	}
 }
 
-func run(infile, outfile *string) error {
+func (app *App) run() error {
 
-	infp, err := os.Open(*infile)
+	infp, err := os.Open(app.AddressFile)
 	if err != nil {
-		return fmt.Errorf("open %s: ", *infile)
+		return fmt.Errorf("open %s: ", app.AddressFile)
 	}
 	defer infp.Close()
 
-	outfp, err := os.Create(*outfile)
+	var outfp *os.File
+	if app.GeoDecodeFile != "" {
+		outfp, err = os.Create(app.GeoDecodeFile)
+	} else {
+		outfp = os.Stdout
+	}
 	if err != nil {
-		return fmt.Errorf("open %s: ", *outfile)
+		return fmt.Errorf("open %s: ", app.GeoDecodeFile)
 	}
 	defer outfp.Close()
 
-	reader := csv.NewReader(infp)
-	reader.LazyQuotes = true
+	eg, ctx := errgroup.WithContext(context.Background())
+	q := make(chan string, 1000)
 
-	client := &http.Client{}
+	eg.Go(func() error {
+		return app.enqueue(ctx, infp, q)
+	})
+
+	eg.Go(func() error {
+		return app.putGeocode(ctx, outfp, q)
+	})
+
+	if err := eg.Wait(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (app *App) enqueue(ctx context.Context, fp *os.File, q chan<- string) error {
+	reader := csv.NewReader(fp)
+	reader.LazyQuotes = true
 
 	for {
 		records, err := reader.Read()
@@ -82,18 +106,30 @@ func run(infile, outfile *string) error {
 			break
 		}
 		if err != nil {
-			log.Fatal(err)
+			return fmt.Errorf("error while reading %s", fp.Name())
 		}
 
-		lat, lng, err := geoDecode(records[0], client)
-		if err != nil {
-			log.Fatal(err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case q <- records[0]:
 		}
-		fmt.Fprintf(outfp, "%s,%sN,%s,%s\n", records[0], convert(lat), fmt.Sprint(lat), convert(lng))
 	}
-	outfp.Sync()
-
+	close(q)
 	return nil
+}
+
+func (app *App) putGeocode(ctx context.Context, fp *os.File, q <-chan string) error {
+	for address := range q {
+		lat, lng, err := app.geocode(ctx, address)
+		if err != nil {
+			return fmt.Errorf("decode %s", err)
+		}
+		fmt.Fprintf(fp, "%s,%sN,%sE\n", address, convert(lat), convert(lng))
+	}
+	fp.Sync()
+	return nil
+
 }
 
 // 10 進数による座標を 60 進数(度分秒)に変換する
@@ -109,33 +145,30 @@ func convert(n float64) string {
 	return fmt.Sprintf("%d°%d'%3.1f\"", int(degree), minute, second)
 }
 
-func geoDecode(address string, client *http.Client) (lat, lng float64, err error) {
+func (app *App) geocode(ctx context.Context, address string) (lat, lng float64, err error) {
 	values := url.Values{}
 	values.Add("address", address)
 
-	// geo decoding using google maps api
 	req, err := http.NewRequest("GET", "https://maps.googleapis.com/maps/api/geocode/json", nil)
 	if err != nil {
 		return -1, -1, err
 	}
+	req = req.WithContext(ctx)
+
 	req.URL.RawQuery = values.Encode()
-	resp, err := client.Do(req)
+	resp, err := app.Client.Do(req)
 	if err != nil {
 		return -1, -1, err
 	}
+	defer resp.Body.Close()
 
-	var geo Geo
-	err2 := decodeBody(resp, &geo)
-	if err2 != nil {
+	var geo geo
+	decoder := json.NewDecoder(resp.Body)
+	err = decoder.Decode(&geo)
+	if err != nil {
 		return -1, -1, err
 	}
 
 	l := geo.Results[0].Geometry.Location
 	return l.Lat, l.Lng, nil
-}
-
-func decodeBody(resp *http.Response, out interface{}) error {
-	defer resp.Body.Close()
-	decoder := json.NewDecoder(resp.Body)
-	return decoder.Decode(out)
 }
