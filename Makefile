@@ -9,16 +9,28 @@ LDFLAGS := -ldflags="-X 'main.version=$(VERSION)' -X 'main.Revision=$(REVISION)'
 
 .DEFAULT_GOAL=build
 
+GITHUB_ORG=kiririmode
+
+ifndef GOBIN
+GOBIN := $(shell echo "$${GOPATH%%:*}/bin")
+endif
+
 ## Download dependencies
 deps:
 	go get -d $(VERBOSE)
 
+LINT      := $(GOBIN)/golint
+GOX       := $(GOBIN)/gox
+GHR       := $(GOBIN)/ghr
+MAKE2HELP := $(GOBIN)/make2help
+
+$(LINT):      ; go get github.com/golang/lint/golint
+$(GOX):       ; go get github.com/mitchellh/gox
+$(GHR):       ; go get github.com/tcnksm/ghr
+$(MAKE2HELP): ; go get github.com/Songmu/make2help/cmd/make2help
+
 ## Setup
-setup: deps
-	go get github.com/golang/lint/golint
-	go get github.com/Songmu/make2help/cmd/make2help
-	go get github.com/mitchellh/gox
-	go get github.com/tcnksm/ghr
+setup: deps $(LINT) $(GOX) $(GHR) $(MAKE2HELP)
 
 ## Lint
 lint: setup
@@ -30,7 +42,7 @@ build: setup lint
 	go build -a $(LDFLAGS)
 
 ## Cross-build
-cross-build: setup lint
+cross-build: setup lint $(GOX)
 	rm -rf ./out
 	gox -osarch $(OSARCH) $(BUILD_FLAGS) -output "./out/${NAME}_${VERSION}_{{.OS}}_{{.Arch}}"
 
@@ -38,7 +50,7 @@ cross-build: setup lint
 install: setup lint
 	go install $(VERBOSE) $(BUILD_FLAGS)
 
-package: cross-build
+package: $(GHR)
 	rm -rf pkg \
 		&& mkdir pkg \
 		&& pushd out \
@@ -47,7 +59,7 @@ package: cross-build
 
 ## Release
 release: package
-	ghr $(VERSION) pkg
+	ghr -u $(GITHUB_ORG) $(VERSION) pkg
 
 ## Show help
 help:
@@ -55,6 +67,6 @@ help:
 
 clean:
 	@rm -f .#* \#* geocoding
-	@rm -rf bin pkg dist
+	@rm -rf bin pkg dist out
 
 .PHONY: install clean
