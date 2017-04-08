@@ -1,6 +1,6 @@
 NAME := geocoding
 VERBOSE := $(if $(VERBOSE),-v)
-VERSION := $(shell git describe --tags --abbrev=0)
+VERSION := $(shell git describe --tags --abbrev=0 --always)
 REVISION := $(shell git rev-parse --short HEAD)
 OSARCH="darwin/amd64 linux/386 linux/amd64 windows/386 windows/amd64"
 
